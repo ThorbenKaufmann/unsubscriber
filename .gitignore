@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# scan --json output contains personal unsubscribe tokens
+*.json
+config.ini
+blocklist.txt
