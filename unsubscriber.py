@@ -3,6 +3,7 @@
 
   scan         read-only overview of all senders with a List-Unsubscribe header
   unsubscribe  pick senders by number to unsubscribe from, or to block as spam
+  purge        move their mail to the trash on the IMAP server
 
 Unsubscribe methods found in the List-Unsubscribe header:
 
@@ -23,7 +24,7 @@ that your address is alive.
 Blocked senders go to a blocklist file and their existing mails are tagged as
 spam right away. Your own tagging script can apply the list to new mail.
 
-Requires only Python 3.8+ and the notmuch command line tool.
+Requires only Python 3.9+ and the notmuch command line tool.
 """
 
 import argparse
@@ -494,6 +495,13 @@ def one_click(url, timeout):
         return False, str(getattr(e, "reason", e))
 
 
+def get_password(passcmd, address):
+    """Run the configured password command for one of our addresses."""
+    cmd = passcmd.format(sender=address, account=address)
+    out = subprocess.run(shlex.split(cmd), check=True, capture_output=True)
+    return out.stdout.decode().splitlines()[0]
+
+
 def send_mail(sender, uri, smtp, timeout):
     """Send the unsubscribe mail for a mailto: URI from our own address.
 
@@ -516,9 +524,7 @@ def send_mail(sender, uri, smtp, timeout):
             return True, "sendmail"
         host = smtp["host"]
         port = int(smtp.get("port", "465"))
-        password = subprocess.run(
-            shlex.split(smtp["passcmd"].format(sender=sender)), check=True,
-            capture_output=True).stdout.decode().splitlines()[0]
+        password = get_password(smtp["passcmd"], sender)
         ctx = ssl.create_default_context()
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=timeout, context=ctx)
@@ -633,6 +639,198 @@ def unsubscribe(args):
                   f"{target or '(no link)'}{hint}")
 
 
+# ── purge: clean up the server ────────────────────────────────────────
+
+def purge_rules(only):
+    """What to remove: blocked domains/addresses and unsubscribed senders.
+
+    Returns [(label, imap search term, match function on (name, addr))]."""
+    rules = []
+    if only in (None, "blocked"):
+        for e in sorted(read_blocklist()):
+            if "@" in e:
+                match = lambda name, addr, e=e: addr == e
+            else:
+                match = lambda name, addr, e=e: aligned_sub(domain_of(addr), e)
+            rules.append((f"blocked {e}", e, match))
+    if only in (None, "unsubscribed"):
+        senders = {}
+        for (key, _), entry in read_log().items():
+            if entry.get("ok"):
+                senders[key] = entry["from"]
+        for key, addr in sorted(senders.items()):
+            # Same grouping key as in collect(): display name plus address,
+            # so leaving one newsletter of a shared sender address does not
+            # remove the others.
+            match = lambda name, a, key=key: f"{name.strip()} <{a}>".lower() == key
+            rules.append((f"unsubscribed {key}", addr, match))
+    return rules
+
+
+def aligned_sub(domain, blocked):
+    """A blocked domain also covers its subdomains, never the other way."""
+    return domain == blocked or domain.endswith("." + blocked)
+
+
+def imap_quote(mailbox):
+    return '"' + mailbox.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def imap_connect(account, imap, timeout):
+    import imaplib
+    host = imap["host"]
+    port = int(imap.get("port", "993"))
+    conn = imaplib.IMAP4_SSL(host, port, timeout=timeout,
+                             ssl_context=ssl.create_default_context())
+    conn.login(imap.get("user", "{sender}").format(sender=account, account=account),
+               get_password(imap["passcmd"], account))
+    return conn
+
+
+def find_trash(conn, imap):
+    """The mailbox flagged \\Trash (RFC 6154), else the configured name."""
+    typ, data = conn.list()
+    for line in data if typ == "OK" else []:
+        if not isinstance(line, bytes):
+            continue
+        m = re.match(rb'\((?P<flags>[^)]*)\) (?:"[^"]*"|NIL) (?P<name>.+)$', line)
+        if m and b"\\trash" in m.group("flags").lower():
+            return m.group("name").decode().strip().strip('"')
+    return imap.get("trash", "Trash")
+
+
+def search_mailbox(conn, folder, rules):
+    """UIDs in folder matching a rule: {uid: (label, from)}. Read-only."""
+    typ, _ = conn.select(imap_quote(folder), readonly=True)
+    if typ != "OK":
+        return None
+    candidates = set()
+    for _, term, _ in rules:
+        # FROM is a substring search on the server; the exact check follows.
+        typ, data = conn.uid("SEARCH", "UNFLAGGED", "FROM", imap_quote(term))
+        if typ == "OK" and data and data[0]:
+            candidates.update(data[0].split())
+    found = {}
+    uids = sorted(candidates, key=int)
+    for i in range(0, len(uids), 200):
+        chunk = b",".join(uids[i:i + 200]).decode()
+        typ, data = conn.uid("FETCH", chunk, "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+        for item in data if typ == "OK" else []:
+            if not isinstance(item, tuple):
+                continue
+            m = re.search(rb"UID (\d+)", item[0])
+            if not m:
+                continue
+            msg = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(item[1])
+            try:
+                name, addr = email.utils.parseaddr(str(msg.get("From", "")))
+            except Exception:
+                continue
+            addr = addr.lower()
+            for label, _, match in rules:
+                if match(name, addr):
+                    found[m.group(1)] = (label, addr)
+                    break
+    return found
+
+
+def move_to_trash(conn, folder, uids, trash):
+    """Move UIDs to the trash; returns the number moved."""
+    conn.select(imap_quote(folder))
+    moved = 0
+    for i in range(0, len(uids), 200):
+        chunk = b",".join(uids[i:i + 200]).decode()
+        if "MOVE" in conn.capabilities:
+            typ, _ = conn.uid("MOVE", chunk, imap_quote(trash))
+        else:
+            typ, _ = conn.uid("COPY", chunk, imap_quote(trash))
+            if typ == "OK":
+                conn.uid("STORE", chunk, "+FLAGS.SILENT", r"(\Deleted)")
+                # Without UIDPLUS a plain EXPUNGE could hit other messages
+                # marked deleted, so leave them flagged in that case.
+                if "UIDPLUS" in conn.capabilities:
+                    conn.uid("EXPUNGE", chunk)
+        if typ == "OK":
+            moved += len(uids[i:i + 200])
+    return moved
+
+
+def purge(args):
+    cfg = load_config()
+    if not cfg.has_section("imap"):
+        sys.exit(f"purge needs an [imap] section in {CONFIG_FILE}")
+    imap = dict(cfg["imap"])
+    accounts = [a.strip() for a in imap.get("accounts", "").split(",") if a.strip()] \
+        or sorted(own_addresses(args.config))
+    folders = args.folder or [f.strip() for f in imap.get("folders", "INBOX").split(",")]
+
+    rules = purge_rules(args.only)
+    if args.sender:
+        rules = [r for r in rules if args.sender.lower() in r[0]]
+    if not rules:
+        print("Nothing to purge: no blocked or unsubscribed senders"
+              + (f" matching {args.sender!r}" if args.sender else "") + ".")
+        return
+    print(f"{len(rules)} senders, folders {', '.join(folders)}, "
+          f"accounts {', '.join(accounts)}\n(flagged messages are never touched)\n")
+
+    plan = []
+    for account in accounts:
+        try:
+            conn = imap_connect(account, imap, args.timeout)
+        except Exception as e:
+            print(f"  {account}: cannot log in ({type(e).__name__}: {e})")
+            continue
+        with conn:
+            trash = find_trash(conn, imap)
+            for folder in folders:
+                found = search_mailbox(conn, folder, rules)
+                if found is None:
+                    print(f"  {account}/{folder}: no such folder")
+                    continue
+                if not found:
+                    continue
+                per_rule = collections.Counter(label for label, _ in found.values())
+                print(f"  {account}/{folder}: {len(found)} messages -> {trash}")
+                for label, n in per_rule.most_common():
+                    print(f"    {n:>5}  {label}")
+                plan.append((account, folder, trash, sorted(found, key=int), per_rule))
+
+    total = sum(len(p[3]) for p in plan)
+    if not total:
+        print("Nothing found on the server.")
+        return
+    if args.dry_run:
+        print(f"\nDry run: {total} messages would be moved to the trash.")
+        return
+    answer = read_line(f"\nMove {total} messages to the trash? [y/N] ")
+    if answer.strip().lower() not in ("y", "yes", "j", "ja"):
+        print("Nothing changed.")
+        return
+
+    for account, folder, trash, uids, per_rule in plan:
+        try:
+            conn = imap_connect(account, imap, args.timeout)
+            with conn:
+                moved = move_to_trash(conn, folder, uids, trash)
+        except Exception as e:
+            moved, error = 0, f"{type(e).__name__}: {e}"
+        else:
+            error = ""
+        print(f"  {account}/{folder}: {moved} of {len(uids)} moved"
+              + (f"  ({error})" if error else ""))
+        write_purge_log({"date": datetime.datetime.now().isoformat(timespec="seconds"),
+                         "account": account, "folder": folder, "trash": trash,
+                         "moved": moved, "planned": len(uids),
+                         "senders": dict(per_rule), "error": error})
+
+
+def write_purge_log(entry):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "purge.jsonl"), "a") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 def main():
     cfg = load_config()
     ap = argparse.ArgumentParser(
@@ -655,6 +853,16 @@ def main():
     u.add_argument("--force", action="store_true", help="also unsubscribe unverified senders")
     u.add_argument("--timeout", type=float, default=20, help="network timeout in s (default 20)")
     u.set_defaults(func=unsubscribe)
+
+    p = sub.add_parser("purge", help="move mail of blocked/unsubscribed senders "
+                                     "to the trash on the IMAP server")
+    p.add_argument("-n", "--dry-run", action="store_true", help="only count, change nothing")
+    p.add_argument("--only", choices=("blocked", "unsubscribed"), help="limit to one kind")
+    p.add_argument("--sender", metavar="TEXT", help="limit to senders containing TEXT")
+    p.add_argument("--folder", action="append",
+                   help="IMAP folder to clean, repeatable (default: INBOX or [imap] folders)")
+    p.add_argument("--timeout", type=float, default=30, help="network timeout in s (default 30)")
+    p.set_defaults(func=purge)
 
     args = ap.parse_args()
     try:

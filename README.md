@@ -5,9 +5,10 @@ Leave newsletters in bulk, straight from your local mail archive.
 `unsubscriber` reads a [notmuch](https://notmuchmail.org) database, groups all
 mail carrying a `List-Unsubscribe` header by sender, and lets you pick by number
 which ones to leave. Senders turning out to be fakes go on a blocklist instead,
-and their mail is tagged as spam.
+and their mail is tagged as spam. Finally, `purge` clears what they sent out
+of your mailbox on the server.
 
-No dependencies besides Python 3.8+ and the `notmuch` command line tool.
+No dependencies besides Python 3.9+ and the `notmuch` command line tool.
 
 ```
   nr     #  last        method       auth  state    sender
@@ -68,6 +69,8 @@ Use `-n` for a dry run first.
 ./unsubscriber.py scan --json out.json  # details incl. unsubscribe URLs
 ./unsubscriber.py unsubscribe -n        # dry run: show what would happen
 ./unsubscriber.py unsubscribe           # do it
+./unsubscriber.py purge -n              # count their mail on the server
+./unsubscriber.py purge                 # move it to the trash
 ```
 
 Global options go before the command:
@@ -79,6 +82,7 @@ Global options go before the command:
 | `--authserv-id ID` | trust only `Authentication-Results` from this server |
 
 `unsubscribe` also takes `--force` (allow unverified senders) and `--timeout`.
+`purge` takes `--only blocked|unsubscribed`, `--sender TEXT` and `--folder`.
 
 ## Configuration
 
@@ -96,6 +100,12 @@ host = smtp.example.com
 port = 465
 user = {sender}
 passcmd = pass show mail/{sender}
+
+[imap]                                  ; needed for purge only
+host = imap.example.com
+port = 993
+user = {sender}
+passcmd = pass show mail/{sender}
 ```
 
 `{sender}` is replaced by the address that received the newsletter. That
@@ -103,6 +113,28 @@ address must send the unsubscribe mail, otherwise the list cannot tell whom to
 remove. Instead of SMTP you can set `sendmail = /usr/sbin/sendmail -oi`, but only
 if your MTA relays through your provider: mail sent directly from a home
 connection fails SPF/DMARC.
+
+## Cleaning up the server
+
+Everything above works on your local copy. `purge` logs in to your IMAP
+accounts and moves the mail of blocked and unsubscribed senders to the trash:
+
+- **Trash, not delete.** A wrong pick can be restored until your provider
+  empties the trash. The trash folder is found through its RFC 6154 marker.
+- **Flagged mail is never touched.**
+- **Exact match.** The server's `FROM` search only preselects; each candidate's
+  From header is then checked exactly. A blocked domain covers its
+  subdomains, a blocked freemail address only itself, and an unsubscribed
+  newsletter only mail with the same display name and address. So leaving
+  one of several newsletters sent from the same address keeps the others.
+- **Confirmation.** It shows counts per account and sender first, then asks.
+  `-n` only counts.
+
+Default is INBOX of every address in your notmuch config. Set up the `[imap]`
+section of the config file (see Configuration). Each run is logged.
+
+If your local archive is synced pull-only (e.g. mbsync with `Sync Pull` and
+`Expunge None`), your local copies stay untouched.
 
 ## Blocking new mail too
 
@@ -119,7 +151,7 @@ fi
 ```
 
 This only acts locally. On the server, and on your phone, the mail stays in
-the inbox.
+the inbox, until you run `purge`.
 
 ## Files
 
@@ -128,6 +160,7 @@ the inbox.
 | `~/.config/unsubscriber/config.ini` | settings |
 | `~/.config/unsubscriber/blocklist.txt` | blocked domains/addresses, one per line |
 | `~/.local/state/unsubscriber/log.jsonl` | one line per unsubscribe attempt |
+| `~/.local/state/unsubscriber/purge.jsonl` | one line per purged account and folder |
 
 `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honoured. The `--json` output
 contains personal unsubscribe tokens and is written with mode 600.
