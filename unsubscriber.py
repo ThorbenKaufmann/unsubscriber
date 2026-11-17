@@ -480,10 +480,26 @@ def ask(prompt, n):
             print(f"  {e} - use numbers like 1,3,5-8 (empty for none)")
 
 
+def ascii_url(url):
+    """Percent-encode non-ASCII characters, keeping everything else as is.
+
+    Some senders put raw UTF-8 into the header, which arrives here decoded
+    as Latin-1 ('TRACE32Â®'). If the text round-trips that way, the
+    original bytes are used, otherwise its UTF-8 encoding."""
+    if url.isascii():
+        return url
+    try:
+        raw = url.encode("latin-1")
+        raw.decode("utf-8")
+    except UnicodeError:
+        raw = url.encode("utf-8")
+    return urllib.parse.quote(raw, safe="%/:=&?~#+!$,;'@()*[]")
+
+
 def one_click(url, timeout):
     """RFC 8058 one-click POST. Returns (ok, detail)."""
     req = urllib.request.Request(
-        url, data=b"List-Unsubscribe=One-Click", method="POST",
+        ascii_url(url), data=b"List-Unsubscribe=One-Click", method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "User-Agent": USER_AGENT})
     try:
@@ -493,6 +509,9 @@ def one_click(url, timeout):
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
         return False, str(getattr(e, "reason", e))
+    except Exception as e:
+        # Malformed URLs or odd server replies must not end the whole run.
+        return False, f"{type(e).__name__}: {e}"
 
 
 def get_password(passcmd, address):
@@ -582,6 +601,24 @@ def unsubscribe(args):
             print("  flagged ones skipped")
 
     print("\nDry run, nothing sent:" if args.dry_run else "")
+
+    # Blocking first: it is local and quick, and must not be lost if
+    # something goes wrong on the network afterwards.
+    spam_rows = [rows[i - 1] for i in sorted(spam)]
+    entries = sorted({block_entry(g["from"]) for g in spam_rows})
+    if entries:
+        configs = [args.config] + [c.strip() for c in
+                                   cfg.get("unsubscriber", "extra_configs", fallback="").split(",")
+                                   if c.strip()]
+        tags = cfg.get("unsubscriber", "spam_tags", fallback=DEFAULT_SPAM_TAGS)
+        if args.dry_run:
+            print(f"  would block: {', '.join(entries)}  (tags {tags})")
+        else:
+            new = add_to_blocklist(entries)
+            print(f"  blocklist +{len(new)}: " + ", ".join(new or ["(all known)"]))
+            for db, n in tag_as_spam(entries, configs, tags):
+                print(f"  tagged {tags} in {db}: {n} messages")
+
     manual = []
     for _, g in chosen:
         label = g["name"] or g["from"]
@@ -603,27 +640,15 @@ def unsubscribe(args):
             if args.dry_run:
                 print(f"  would {what}  ({label} -> {rcpt})")
                 continue
-            ok, detail = run()
+            try:
+                ok, detail = run()
+            except Exception as e:
+                ok, detail = False, f"{type(e).__name__}: {e}"
             print(f"  {'ok  ' if ok else 'FAIL'}  {label} -> {rcpt}  ({what}, {detail})")
             write_log({"date": datetime.datetime.now().isoformat(timespec="seconds"),
                        "key": g["key"], "from": g["from"], "rcpt": t["rcpt"],
                        "method": t["method"], "target": what, "ok": ok,
                        "detail": detail})
-
-    spam_rows = [rows[i - 1] for i in sorted(spam)]
-    entries = sorted({block_entry(g["from"]) for g in spam_rows})
-    if entries:
-        configs = [args.config] + [c.strip() for c in
-                                   cfg.get("unsubscriber", "extra_configs", fallback="").split(",")
-                                   if c.strip()]
-        tags = cfg.get("unsubscriber", "spam_tags", fallback=DEFAULT_SPAM_TAGS)
-        if args.dry_run:
-            print(f"  would block: {', '.join(entries)}  (tags {tags})")
-        else:
-            new = add_to_blocklist(entries)
-            print(f"  blocklist +{len(new)}: " + ", ".join(new or ["(all known)"]))
-            for db, n in tag_as_spam(entries, configs, tags):
-                print(f"  tagged {tags} in {db}: {n} messages")
 
     if manual:
         print("\nNot automatable, please handle by hand:")
